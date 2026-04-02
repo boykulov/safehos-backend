@@ -8,11 +8,26 @@ const TRUSTED_WHITELIST = new Set([
   'outlook.com', 'microsoftonline.com', 'openai.com', 'chatgpt.com',
   'amazon.com', 'github.com', 'stackoverflow.com', 'cloudflare.com',
   'apple.com', 'linkedin.com', 'facebook.com', 'twitter.com', 'x.com',
-  'zoom.us', 'slack.com', 'notion.so',
+  'zoom.us', 'slack.com', 'notion.so', 'dropbox.com', 'stripe.com',
 ]);
 
-const SUSPICIOUS_KEYWORDS = ['login', 'secure', 'verify', 'account', 'signin', 'update', 'confirm', 'banking'];
-const KNOWN_BRANDS = ['google', 'microsoft', 'amazon', 'paypal', 'apple', 'facebook', 'chase'];
+const SUSPICIOUS_KEYWORDS = [
+  'login', 'secure', 'verify', 'account', 'signin',
+  'update', 'confirm', 'banking', 'wallet', 'support',
+  'helpdesk', 'recovery', 'unlock', 'suspend',
+];
+
+const KNOWN_BRANDS = [
+  'google', 'microsoft', 'amazon', 'paypal', 'apple',
+  'facebook', 'chase', 'wellsfargo', 'netflix', 'instagram',
+  'linkedin', 'twitter', 'dropbox', 'stripe', 'coinbase',
+];
+
+// Замена leet-символов на буквы: go0gle → google, paypa1 → paypal
+const LEET_MAP: Record<string, string> = {
+  '0': 'o', '1': 'l', '3': 'e', '4': 'a',
+  '5': 's', '6': 'g', '7': 't', '8': 'b', '@': 'a',
+};
 
 @Injectable()
 export class DomainService {
@@ -25,7 +40,10 @@ export class DomainService {
     const domain = this.extractDomain(url);
 
     if (TRUSTED_WHITELIST.has(domain)) {
-      return { domain, decision: 'trusted', riskScore: 0, flags: [], message: 'Доверенный домен', eventId: null };
+      return {
+        domain, decision: 'trusted', riskScore: 0,
+        flags: [], message: 'Доверенный домен', eventId: null,
+      };
     }
 
     let existing = await this.domainRepo.findOne({ where: { domain, companyId } });
@@ -35,13 +53,8 @@ export class DomainService {
 
     if (existing) {
       return {
-        domain,
-        decision: existing.decision,
-        riskScore: existing.riskScore,
-        flags: [],
-        message: existing.reason,
-        eventId: null,
-        cached: true,
+        domain, decision: existing.decision, riskScore: existing.riskScore,
+        flags: [], message: existing.reason, eventId: null, cached: true,
       };
     }
 
@@ -58,23 +71,52 @@ export class DomainService {
     }
 
     if (decision === 'dangerous') {
-      await this.saveDomainDecision(domain, companyId, 'blocked', score, 'Автоматически заблокирован', '', false);
+      await this.saveDomainDecision(
+        domain, companyId, 'blocked', score,
+        'Автоматически заблокирован', '', false,
+      );
     }
 
     return {
-      domain,
-      decision,
-      riskScore: score,
-      flags,
-      eventId,
-      message: this.getDecisionMessage(decision),
+      domain, decision, riskScore: score,
+      flags, eventId, message: this.getDecisionMessage(decision),
     };
+  }
+
+  private normalizeLeet(str: string): string {
+    return str.split('').map(c => LEET_MAP[c] || c).join('');
   }
 
   private scoreDomain(domain: string): { score: number; flags: string[] } {
     const flags: string[] = [];
     let score = 0;
 
+    const domainRoot = domain.split('.')[0];
+    const normalizedRoot = this.normalizeLeet(domainRoot);
+
+    // Проверка тайпосквоттинга с учётом leet-замен
+    for (const brand of KNOWN_BRANDS) {
+      // Точное совпадение после нормализации
+      if (normalizedRoot === brand && domainRoot !== brand) {
+        score += 60;
+        flags.push(`leet_typosquat:${brand}`);
+        break;
+      }
+      // Похожесть по символам
+      if (domainRoot !== brand && this.isSimilar(normalizedRoot, brand)) {
+        score += 45;
+        flags.push(`typosquat:${brand}`);
+        break;
+      }
+      // Бренд содержится в домене (google-login.com)
+      if (domain.includes(brand) && domain !== `${brand}.com`) {
+        score += 30;
+        flags.push(`brand_in_domain:${brand}`);
+        break;
+      }
+    }
+
+    // Подозрительные слова
     for (const keyword of SUSPICIOUS_KEYWORDS) {
       if (domain.includes(keyword)) {
         score += 20;
@@ -83,22 +125,20 @@ export class DomainService {
       }
     }
 
+    // Много дефисов
     const hyphens = (domain.match(/-/g) || []).length;
-    if (hyphens > 2) { score += 15; flags.push('excessive_hyphens'); }
+    if (hyphens >= 2) { score += 15; flags.push('excessive_hyphens'); }
 
+    // Много цифр
     const digits = (domain.match(/\d/g) || []).length;
-    if (digits > 3) { score += 10; flags.push('many_digits'); }
+    if (digits >= 2) { score += 15; flags.push('many_digits'); }
 
-    const domainRoot = domain.split('.')[0];
-    for (const brand of KNOWN_BRANDS) {
-      if (domainRoot !== brand && this.isSimilar(domainRoot, brand)) {
-        score += 40;
-        flags.push(`typosquat:${brand}`);
-        break;
-      }
-    }
+    // Длинный домен
+    if (domain.length > 25) { score += 10; flags.push('long_domain'); }
 
-    if (domain.length > 30) { score += 10; flags.push('long_domain'); }
+    // Много частей в домене (secure.login.verify.com)
+    const parts = domain.split('.');
+    if (parts.length > 3) { score += 10; flags.push('many_subdomains'); }
 
     return { score: Math.min(score, 100), flags };
   }
@@ -114,11 +154,8 @@ export class DomainService {
   }
 
   private async createSuspiciousEvent(
-    domain: string,
-    score: number,
-    flags: string[],
-    companyId: string,
-    userId: string,
+    domain: string, score: number, flags: string[],
+    companyId: string, userId: string,
   ): Promise<string> {
     const event = new DomainDecision();
     event.domain = domain;
@@ -128,29 +165,21 @@ export class DomainService {
     event.reason = `Flags: ${flags.join(', ')}`;
     event.decidedBy = userId;
     event.isGlobal = false;
-
     const saved = await this.domainRepo.save(event);
     return saved.id;
   }
 
   async saveDomainDecision(
-    domain: string,
-    companyId: string,
-    decision: string,
-    riskScore: number,
-    reason: string,
-    decidedBy: string,
-    isGlobal: boolean,
+    domain: string, companyId: string, decision: string,
+    riskScore: number, reason: string, decidedBy: string, isGlobal: boolean,
   ): Promise<DomainDecision> {
     const existing = await this.domainRepo.findOne({ where: { domain, companyId } });
-
     if (existing) {
       existing.decision = decision;
       existing.reason = reason;
       existing.decidedBy = decidedBy;
       return this.domainRepo.save(existing);
     }
-
     const newDecision = new DomainDecision();
     newDecision.domain = domain;
     newDecision.companyId = companyId;
@@ -159,7 +188,6 @@ export class DomainService {
     newDecision.reason = reason;
     newDecision.decidedBy = decidedBy;
     newDecision.isGlobal = isGlobal;
-
     return this.domainRepo.save(newDecision);
   }
 
@@ -176,9 +204,7 @@ export class DomainService {
       let hostname = parsed.hostname;
       if (hostname.startsWith('www.')) hostname = hostname.slice(4);
       return hostname;
-    } catch {
-      return url;
-    }
+    } catch { return url; }
   }
 
   private getDecisionMessage(decision: string): string {
