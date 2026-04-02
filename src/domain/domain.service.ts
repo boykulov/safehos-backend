@@ -14,7 +14,7 @@ const TRUSTED_WHITELIST = new Set([
 const SUSPICIOUS_KEYWORDS = [
   'login', 'secure', 'verify', 'account', 'signin',
   'update', 'confirm', 'banking', 'wallet', 'support',
-  'helpdesk', 'recovery', 'unlock', 'suspend',
+  'helpdesk', 'recovery', 'unlock', 'suspend', 'password',
 ];
 
 const KNOWN_BRANDS = [
@@ -23,8 +23,7 @@ const KNOWN_BRANDS = [
   'linkedin', 'twitter', 'dropbox', 'stripe', 'coinbase',
 ];
 
-// Замена leet-символов на буквы: go0gle → google, paypa1 → paypal
-const LEET_MAP: Record<string, string> = {
+const LEET_MAP = {
   '0': 'o', '1': 'l', '3': 'e', '4': 'a',
   '5': 's', '6': 'g', '7': 't', '8': 'b', '@': 'a',
 };
@@ -39,47 +38,45 @@ export class DomainService {
   async checkDomain(url: string, companyId: string, userId: string) {
     const domain = this.extractDomain(url);
 
+    // Белый список — сразу trusted
     if (TRUSTED_WHITELIST.has(domain)) {
-      return {
-        domain, decision: 'trusted', riskScore: 0,
-        flags: [], message: 'Доверенный домен', eventId: null,
-      };
+      return { domain, decision: 'trusted', riskScore: 0, flags: [], message: 'Доверенный домен', eventId: null };
     }
 
+    // Ищем существующее решение
     let existing = await this.domainRepo.findOne({ where: { domain, companyId } });
     if (!existing) {
       existing = await this.domainRepo.findOne({ where: { domain, isGlobal: true } });
     }
 
-    if (existing) {
+    if (existing && existing.decision !== 'pending') {
       return {
         domain, decision: existing.decision, riskScore: existing.riskScore,
         flags: [], message: existing.reason, eventId: null, cached: true,
       };
     }
 
+    // Анализируем домен
     const { score, flags } = this.scoreDomain(domain);
 
-    let decision: string;
-    if (score >= 70) decision = 'dangerous';
-    else if (score >= 30) decision = 'suspicious';
-    else decision = 'trusted';
-
-    let eventId: string | null = null;
-    if (decision === 'suspicious') {
-      eventId = await this.createSuspiciousEvent(domain, score, flags, companyId, userId);
+    // Score = 0 → полностью безопасный
+    if (score === 0) {
+      return { domain, decision: 'trusted', riskScore: 0, flags: [], message: 'Домен безопасен', eventId: null };
     }
 
-    if (decision === 'dangerous') {
-      await this.saveDomainDecision(
-        domain, companyId, 'blocked', score,
-        'Автоматически заблокирован', '', false,
-      );
-    }
+    // Любой score > 0 → к модератору
+    const eventId = await this.createSuspiciousEvent(domain, url, score, flags, companyId, userId);
 
     return {
-      domain, decision, riskScore: score,
-      flags, eventId, message: this.getDecisionMessage(decision),
+      domain,
+      decision: 'suspicious',
+      riskScore: score,
+      flags,
+      eventId,
+      fullUrl: url,
+      message: score >= 70
+        ? 'Высокий риск — отправлен модератору для блокировки'
+        : 'Подозрительный домен — отправлен на проверку',
     };
   }
 
@@ -94,51 +91,39 @@ export class DomainService {
     const domainRoot = domain.split('.')[0];
     const normalizedRoot = this.normalizeLeet(domainRoot);
 
-    // Проверка тайпосквоттинга с учётом leet-замен
     for (const brand of KNOWN_BRANDS) {
-      // Точное совпадение после нормализации
       if (normalizedRoot === brand && domainRoot !== brand) {
-        score += 60;
-        flags.push(`leet_typosquat:${brand}`);
-        break;
+        score += 60; flags.push(`leet_typosquat:${brand}`); break;
       }
-      // Похожесть по символам
       if (domainRoot !== brand && this.isSimilar(normalizedRoot, brand)) {
-        score += 45;
-        flags.push(`typosquat:${brand}`);
-        break;
+        score += 45; flags.push(`typosquat:${brand}`); break;
       }
-      // Бренд содержится в домене (google-login.com)
       if (domain.includes(brand) && domain !== `${brand}.com`) {
-        score += 30;
-        flags.push(`brand_in_domain:${brand}`);
-        break;
+        score += 30; flags.push(`brand_in_domain:${brand}`); break;
       }
     }
 
-    // Подозрительные слова
     for (const keyword of SUSPICIOUS_KEYWORDS) {
       if (domain.includes(keyword)) {
-        score += 20;
-        flags.push(`suspicious_keyword:${keyword}`);
-        break;
+        score += 20; flags.push(`suspicious_keyword:${keyword}`); break;
       }
     }
 
-    // Много дефисов
     const hyphens = (domain.match(/-/g) || []).length;
     if (hyphens >= 2) { score += 15; flags.push('excessive_hyphens'); }
 
-    // Много цифр
     const digits = (domain.match(/\d/g) || []).length;
     if (digits >= 2) { score += 15; flags.push('many_digits'); }
 
-    // Длинный домен
     if (domain.length > 25) { score += 10; flags.push('long_domain'); }
 
-    // Много частей в домене (secure.login.verify.com)
     const parts = domain.split('.');
     if (parts.length > 3) { score += 10; flags.push('many_subdomains'); }
+
+    // Нет TLD у известных доменов — подозрительно
+    const tld = parts[parts.length - 1];
+    const suspiciousTlds = ['ru', 'xyz', 'tk', 'ml', 'ga', 'cf', 'gq', 'top', 'club'];
+    if (suspiciousTlds.includes(tld)) { score += 10; flags.push(`suspicious_tld:${tld}`); }
 
     return { score: Math.min(score, 100), flags };
   }
@@ -154,15 +139,21 @@ export class DomainService {
   }
 
   private async createSuspiciousEvent(
-    domain: string, score: number, flags: string[],
-    companyId: string, userId: string,
+    domain: string, url: string, score: number,
+    flags: string[], companyId: string, userId: string,
   ): Promise<string> {
+    // Проверяем нет ли уже pending события для этого домена
+    const existing = await this.domainRepo.findOne({
+      where: { domain, companyId, decision: 'pending' }
+    });
+    if (existing) return existing.id;
+
     const event = new DomainDecision();
     event.domain = domain;
     event.companyId = companyId;
     event.decision = 'pending';
     event.riskScore = score;
-    event.reason = `Flags: ${flags.join(', ')}`;
+    event.reason = `URL: ${url} | Flags: ${flags.join(', ')}`;
     event.decidedBy = userId;
     event.isGlobal = false;
     const saved = await this.domainRepo.save(event);
@@ -205,14 +196,5 @@ export class DomainService {
       if (hostname.startsWith('www.')) hostname = hostname.slice(4);
       return hostname;
     } catch { return url; }
-  }
-
-  private getDecisionMessage(decision: string): string {
-    const messages: Record<string, string> = {
-      trusted: 'Домен безопасен',
-      suspicious: 'Отправлен на проверку модератору',
-      dangerous: 'Заблокирован — высокий риск фишинга',
-    };
-    return messages[decision] || 'Неизвестный статус';
   }
 }
