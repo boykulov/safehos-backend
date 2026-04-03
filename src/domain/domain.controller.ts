@@ -1,4 +1,4 @@
-import { Controller, Post, Get, Body, UseGuards, Request } from '@nestjs/common';
+import { Controller, Post, Get, Delete, Body, Param, UseGuards, Request } from '@nestjs/common';
 import { AuthGuard } from '@nestjs/passport';
 import { DomainService } from './domain.service';
 import { CheckDomainDto } from './dto/check-domain.dto';
@@ -16,5 +16,11 @@ export class DomainController {
   @Get('pending')
   async getPending(@Request() req) {
     return this.domainService.getPendingEvents(req.user.companyId);
+  }
+
+  // Сброс решения по домену (для разблокировки)
+  @Delete('decision/:domain')
+  async resetDecision(@Param('domain') domain: string, @Request() req) {
+    return this.domainService.resetDomainDecision(domain, req.user.companyId);
   }
 }

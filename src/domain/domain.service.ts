@@ -23,7 +23,7 @@ const KNOWN_BRANDS = [
   'linkedin', 'twitter', 'dropbox', 'stripe', 'coinbase',
 ];
 
-const LEET_MAP = {
+const LEET_MAP: Record<string, string> = {
   '0': 'o', '1': 'l', '3': 'e', '4': 'a',
   '5': 's', '6': 'g', '7': 't', '8': 'b', '@': 'a',
 };
@@ -38,12 +38,10 @@ export class DomainService {
   async checkDomain(url: string, companyId: string, userId: string) {
     const domain = this.extractDomain(url);
 
-    // Белый список — сразу trusted
     if (TRUSTED_WHITELIST.has(domain)) {
       return { domain, decision: 'trusted', riskScore: 0, flags: [], message: 'Доверенный домен', eventId: null };
     }
 
-    // Ищем существующее решение
     let existing = await this.domainRepo.findOne({ where: { domain, companyId } });
     if (!existing) {
       existing = await this.domainRepo.findOne({ where: { domain, isGlobal: true } });
@@ -56,27 +54,17 @@ export class DomainService {
       };
     }
 
-    // Анализируем домен
     const { score, flags } = this.scoreDomain(domain);
 
-    // Score = 0 → полностью безопасный
     if (score === 0) {
       return { domain, decision: 'trusted', riskScore: 0, flags: [], message: 'Домен безопасен', eventId: null };
     }
 
-    // Любой score > 0 → к модератору
     const eventId = await this.createSuspiciousEvent(domain, url, score, flags, companyId, userId);
 
     return {
-      domain,
-      decision: 'suspicious',
-      riskScore: score,
-      flags,
-      eventId,
-      fullUrl: url,
-      message: score >= 70
-        ? 'Высокий риск — отправлен модератору для блокировки'
-        : 'Подозрительный домен — отправлен на проверку',
+      domain, decision: 'suspicious', riskScore: score, flags, eventId, fullUrl: url,
+      message: score >= 70 ? 'Высокий риск — отправлен модератору' : 'Подозрительный домен — отправлен на проверку',
     };
   }
 
@@ -87,7 +75,6 @@ export class DomainService {
   private scoreDomain(domain: string): { score: number; flags: string[] } {
     const flags: string[] = [];
     let score = 0;
-
     const domainRoot = domain.split('.')[0];
     const normalizedRoot = this.normalizeLeet(domainRoot);
 
@@ -120,7 +107,6 @@ export class DomainService {
     const parts = domain.split('.');
     if (parts.length > 3) { score += 10; flags.push('many_subdomains'); }
 
-    // Нет TLD у известных доменов — подозрительно
     const tld = parts[parts.length - 1];
     const suspiciousTlds = ['ru', 'xyz', 'tk', 'ml', 'ga', 'cf', 'gq', 'top', 'club'];
     if (suspiciousTlds.includes(tld)) { score += 10; flags.push(`suspicious_tld:${tld}`); }
@@ -142,7 +128,6 @@ export class DomainService {
     domain: string, url: string, score: number,
     flags: string[], companyId: string, userId: string,
   ): Promise<string> {
-    // Проверяем нет ли уже pending события для этого домена
     const existing = await this.domainRepo.findOne({
       where: { domain, companyId, decision: 'pending' }
     });
@@ -180,6 +165,12 @@ export class DomainService {
     newDecision.decidedBy = decidedBy;
     newDecision.isGlobal = isGlobal;
     return this.domainRepo.save(newDecision);
+  }
+
+  async resetDomainDecision(domain: string, companyId: string): Promise<{ success: boolean }> {
+    await this.domainRepo.delete({ domain, companyId });
+    await this.domainRepo.delete({ domain, isGlobal: true });
+    return { success: true };
   }
 
   async getPendingEvents(companyId: string) {
