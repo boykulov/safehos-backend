@@ -18,9 +18,14 @@ export class DomainController {
     return this.domainService.getPendingEvents(req.user.companyId);
   }
 
-  // Сброс решения по домену (для разблокировки)
   @Delete('decision/:domain')
   async resetDecision(@Param('domain') domain: string, @Request() req) {
     return this.domainService.resetDomainDecision(domain, req.user.companyId);
+  }
+
+  // Новый endpoint — получить все актуальные решения для синхронизации
+  @Get('decisions/sync')
+  async syncDecisions(@Request() req) {
+    return this.domainService.getRecentDecisions(req.user.companyId);
   }
 }
