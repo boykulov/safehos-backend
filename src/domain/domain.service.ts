@@ -233,15 +233,7 @@ export class DomainService {
     });
   }
 
-  async saveDomainDecision(domain: string, companyId: string, decision: string, riskScore: number, reason: string, decidedBy: string, isGlobal: boolean): Promise<DomainDecision> {
-    const pending = await this.domainRepo.findOne({ where: { domain, companyId, decision: 'pending' } });
-    if (pending) {
-      pending.decision = decision; pending.reason = reason; pending.decidedBy = decidedBy;
-      return this.domainRepo.save(pending);
-    }
-    const d = this.domainRepo.create({ domain, companyId, decision, riskScore, reason, decidedBy, isGlobal });
-    return this.domainRepo.save(d);
-  }
+
 
   async resetDomainDecision(domain: string, companyId: string): Promise<{ success: boolean; domain?: string }> {
     const normalized = this.allowlistService.normalizeDomain(domain);
