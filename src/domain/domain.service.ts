@@ -132,18 +132,27 @@ export class DomainService {
     if (!event) throw new Error('Event not found');
 
     if (action === 'approved') {
-      // Добавляем в allowlist
-      await this.allowlistService.addToAllowlist(
-        event.domain, isGlobal ? null : companyId, isGlobal, moderatorId,
-        {
-          isWildcard: options.isWildcard || false,
-          category: options.category || 'other',
-          notes: options.notes || '',
-          reason: 'Approved by moderator',
-        }
-      );
+      // Не добавляем в allowlist если домен уже покрыт wildcard родителя
+      const parentPolicy = await this.allowlistService.checkDomainPolicy(event.domain, companyId);
+      const coveredByWildcard = parentPolicy.verdict === 'allow' && parentPolicy.isWildcard;
+
+      if (!coveredByWildcard) {
+        await this.allowlistService.addToAllowlist(
+          event.domain, isGlobal ? null : companyId, isGlobal, moderatorId,
+          {
+            isWildcard: options.isWildcard || false,
+            category: options.category || 'other',
+            notes: options.notes || '',
+            reason: 'Approved by moderator',
+          }
+        );
+      }
+
+      // Если wildcard — автоматически закрываем все pending поддомены
+      if (options.isWildcard) {
+        await this.closeSubdomainPending(event.domain, companyId, moderatorId, isGlobal, options.category);
+      }
     } else {
-      // Добавляем в blocklist
       await this.allowlistService.addToBlocklist(
         event.domain, isGlobal ? null : companyId, isGlobal, moderatorId,
         { reason: 'Blocked by moderator', riskScore: event.riskScore }
@@ -156,7 +165,43 @@ export class DomainService {
     event.decidedBy = moderatorId;
     await this.domainRepo.save(event);
 
-    return { success: true, eventId, domain: event.domain, decision: event.decision };
+    return {
+      success: true, eventId, domain: event.domain,
+      decision: event.decision,
+      isWildcard: options.isWildcard || false,
+    };
+  }
+
+  // Закрыть все pending поддомены при wildcard одобрении
+  private async closeSubdomainPending(
+    baseDomain: string, companyId: string, moderatorId: string,
+    isGlobal: boolean, category?: string
+  ): Promise<number> {
+    // Находим все pending события где домен является поддоменом baseDomain
+    const pendingEvents = await this.domainRepo.find({
+      where: { companyId, decision: 'pending' }
+    });
+
+    const subdomains = pendingEvents.filter(e => {
+      // Проверяем что это поддомен: e.domain заканчивается на .baseDomain
+      return e.domain !== baseDomain && e.domain.endsWith('.' + baseDomain);
+    });
+
+    let closed = 0;
+    for (const sub of subdomains) {
+      // НЕ добавляем поддомен в allowlist — он покрыт wildcard *.baseDomain
+      // Просто закрываем pending запись
+      sub.decision = 'approved';
+      sub.listType = isGlobal ? 'global_allow' : 'org_allow';
+      sub.decidedBy = moderatorId;
+      await this.domainRepo.save(sub);
+      closed++;
+    }
+
+    if (closed > 0) {
+      this.logger.log(`Wildcard ${baseDomain}: auto-approved ${closed} subdomains`);
+    }
+    return closed;
   }
 
   getRiskLevel(score: number): string {

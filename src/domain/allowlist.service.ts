@@ -50,8 +50,14 @@ export class AllowlistService {
     return { verdict: 'unknown', listType: null, reason: 'Domain not in any list', isWildcard: false, category: null };
   }
 
-  private async findInList(domains: string[], companyId: string | null, listTypes: string[]): Promise<DomainDecision | null> {
-    for (const domain of domains) {
+  private async findInList(
+    domains: string[], companyId: string | null, listTypes: string[]
+  ): Promise<DomainDecision | null> {
+    // domains[0] — точный домен, domains[1+] — родительские домены
+    for (let i = 0; i < domains.length; i++) {
+      const domain = domains[i];
+      const isParentDomain = i > 0; // это родительский домен (проверяем поддомен)
+
       let query = this.domainRepo.createQueryBuilder('d')
         .where('d.domain = :domain', { domain })
         .andWhere('d.listType IN (:...listTypes)', { listTypes });
@@ -60,6 +66,12 @@ export class AllowlistService {
         query = query.andWhere('(d.companyId = :companyId OR d.isGlobal = 1)', { companyId });
       } else {
         query = query.andWhere('(d.isGlobal = 1 OR d.companyId IS NULL)');
+      }
+
+      // Если проверяем поддомен через родительский домен —
+      // разрешаем ТОЛЬКО если у родителя isWildcard = true
+      if (isParentDomain) {
+        query = query.andWhere('d.isWildcard = 1');
       }
 
       const result = await query.getOne();

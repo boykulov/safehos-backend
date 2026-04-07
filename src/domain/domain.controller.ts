@@ -1,4 +1,5 @@
-import { Controller, Post, Get, Patch, Delete, Body, Param, UseGuards, Request, Query, Res, ConflictException, BadRequestException } from '@nestjs/common';
+import { Controller, Post, Get, Patch, Delete, Body, Param, UseGuards, Request, Query, Res, ConflictException, BadRequestException, UseInterceptors, UploadedFile } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
 import { AuthGuard } from '@nestjs/passport';
 import { DomainService } from './domain.service';
 import { AllowlistService } from './allowlist.service';
@@ -128,6 +129,41 @@ export class DomainController {
   }
 
   // GET — экспорт allowlist в CSV
+  @Post('allowlist/import')
+  @UseInterceptors(FileInterceptor('file'))
+  async importAllowlist(@UploadedFile() file: any, @Request() req) {
+    if (!file) throw new BadRequestException('CSV file required');
+    const text = file.buffer.toString('utf8');
+    const lines = text.split('\n').map(l => l.trim()).filter(l => l);
+    if (!lines[0]?.toLowerCase().includes('domain')) throw new BadRequestException('Invalid CSV: missing header');
+
+    let imported = 0, skipped = 0, errors: string[] = [];
+    for (let i = 1; i < lines.length; i++) {
+      try {
+        const cols = lines[i].split(',');
+        if (cols.length < 3) continue;
+        const domain   = cols[0].trim();
+        const category = cols[1]?.trim() || 'other';
+        const type     = cols[2]?.trim() || 'global';
+        const wildcard = cols[3]?.trim() === 'yes';
+        const notes    = cols[4]?.trim() || '';
+        if (!domain) continue;
+        const isGlobal = type === 'global';
+        try {
+          await this.allowlistService.addToAllowlist(
+            domain, isGlobal ? null : req.user.companyId, isGlobal, req.user.id,
+            { isWildcard: wildcard, category, notes, reason: 'Imported from CSV' }
+          );
+          imported++;
+        } catch(e: any) {
+          if (e.message?.includes('CONFLICT') || e.message?.includes('already')) skipped++;
+          else errors.push(`${domain}: ${e.message}`);
+        }
+      } catch(e: any) { errors.push(`Row ${i}: ${e.message}`); }
+    }
+    return { imported, skipped, errors, total: lines.length - 1 };
+  }
+
   @Get('allowlist/export')
   async exportAllowlist(@Request() req, @Res() res: any) {
     const list = await this.allowlistService.getAllowlist(req.user.companyId);
