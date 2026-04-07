@@ -15,57 +15,59 @@ export class DecisionService {
   ) {}
 
   async makeDecision(
-    eventId: string,
-    action: 'approved' | 'blocked',
-    reason: string,
-    moderatorId: string,
-    companyId: string,
+    eventId: string, action: 'approved' | 'blocked',
+    reason: string, moderatorId: string, companyId: string,
     isGlobal: boolean,
+    options: { isWildcard?: boolean; category?: string } = {}
   ) {
+    // Получаем pending событие
     const pending = await this.domainService.getPendingEvents(companyId);
     const event = pending.find(e => e.id === eventId);
-
     if (!event) throw new NotFoundException('Событие не найдено');
 
-    const moderatorAction = new ModeratorAction();
-    moderatorAction.eventId = eventId;
-    moderatorAction.domain = event.domain;
-    moderatorAction.companyId = companyId;
-    moderatorAction.action = action;
-    moderatorAction.reason = reason;
-    moderatorAction.moderatorId = moderatorId;
-    moderatorAction.isGlobal = isGlobal;
-    await this.actionRepo.save(moderatorAction);
+    // Сохраняем действие модератора в историю
+    await this.actionRepo.save(this.actionRepo.create({
+      eventId, domain: event.domain, companyId,
+      action, reason, moderatorId, isGlobal,
+    }));
 
-    const decision = action === 'approved' ? 'approved' : 'blocked';
-    const targetCompanyId = isGlobal ? '' : companyId;
-
-    await this.domainService.saveDomainDecision(
-      event.domain,
-      targetCompanyId,
-      decision,
-      event.riskScore,
-      reason || `Решение модератора: ${action}`,
-      moderatorId,
-      isGlobal,
+    // Применяем решение — добавляем в allowlist/blocklist
+    const result = await this.domainService.applyModeratorDecision(
+      eventId, action, moderatorId, companyId, isGlobal, options
     );
 
+    // Мгновенный WebSocket push диспетчерам
     this.eventsGateway.sendDecisionToDispatchers(companyId, {
       type: 'decision',
       eventId,
       domain: event.domain,
-      decision,
-      message: reason || `Домен ${action === 'approved' ? 'одобрен' : 'заблокирован'} модератором`,
+      decision: action === 'approved' ? 'approved' : 'blocked',
+      message: action === 'approved' ? 'Одобрено модератором' : 'Заблокировано модератором',
     });
 
-    return { success: true, eventId, domain: event.domain, decision };
+    return result;
+  }
+
+  async getEventStatus(eventId: string, companyId: string) {
+    // Проверяем в moderator_actions
+    const action = await this.actionRepo.findOne({ where: { eventId } });
+    if (action) {
+      return { eventId, domain: action.domain, decision: action.action, resolved: true };
+    }
+    // Проверяем pending
+    const pending = await this.domainService.getPendingEvents(companyId);
+    const stillPending = pending.find(e => e.id === eventId);
+    if (stillPending) {
+      return { eventId, domain: stillPending.domain, decision: 'pending', resolved: false };
+    }
+    return { eventId, decision: 'unknown', resolved: true };
   }
 
   async getHistory(companyId: string) {
     return this.actionRepo.find({
       where: { companyId },
       order: { createdAt: 'DESC' },
-      take: 100,
+      take: 200,
     });
   }
 }

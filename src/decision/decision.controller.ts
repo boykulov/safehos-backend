@@ -6,11 +6,9 @@ import { IsString, IsBoolean, IsOptional } from 'class-validator';
 class MakeDecisionDto {
   @IsString()
   action: 'approved' | 'blocked';
-
   @IsString()
   @IsOptional()
   reason?: string;
-
   @IsBoolean()
   @IsOptional()
   isGlobal?: boolean;
@@ -23,7 +21,15 @@ export class DecisionController {
 
   @Post(':eventId')
   async decide(@Param('eventId') eventId: string, @Body() dto: MakeDecisionDto, @Request() req) {
-    return this.decisionService.makeDecision(eventId, dto.action, dto.reason || '', req.user.id, req.user.companyId, dto.isGlobal || false);
+    return this.decisionService.makeDecision(
+      eventId, dto.action, dto.reason || '', req.user.id, req.user.companyId, dto.isGlobal || false,
+    );
+  }
+
+  // Новый endpoint — быстрая проверка статуса события (для polling в extension)
+  @Get('status/:eventId')
+  async getStatus(@Param('eventId') eventId: string, @Request() req) {
+    return this.decisionService.getEventStatus(eventId, req.user.companyId);
   }
 
   @Get('history')
