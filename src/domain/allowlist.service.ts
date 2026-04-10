@@ -2,6 +2,8 @@ import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { DomainDecision } from './domain.entity';
+import { ModeratorAction } from '../decision/decision.entity';
+import { EventsGateway } from '../gateway/events.gateway';
 import { LOGISTICS_GLOBAL_ALLOWLIST, GLOBAL_BLOCKLIST_SEEDS } from './logistics-seed';
 
 @Injectable()
@@ -11,6 +13,9 @@ export class AllowlistService {
   constructor(
     @InjectRepository(DomainDecision)
     private domainRepo: Repository<DomainDecision>,
+    @InjectRepository(ModeratorAction)
+    private actionRepo: Repository<ModeratorAction>,
+    private eventsGateway: EventsGateway,
   ) {}
 
   // Проверка домена по всем спискам — главный метод
@@ -50,6 +55,35 @@ export class AllowlistService {
     return { verdict: 'unknown', listType: null, reason: 'Domain not in any list', isWildcard: false, category: null };
   }
 
+  // Проверка: есть ли уже решение по домену в ЛЮБОЙ компании (кросс-компания)
+  async hasExistingDecision(domain: string): Promise<DomainDecision | null> {
+    const normalized = this.normalizeDomain(domain);
+    const parts = normalized.split('.');
+
+    const domainsToCheck: string[] = [normalized];
+    for (let i = 1; i < parts.length - 1; i++) {
+      domainsToCheck.push(parts.slice(i).join('.'));
+    }
+
+    for (let i = 0; i < domainsToCheck.length; i++) {
+      const d = domainsToCheck[i];
+      const isParent = i > 0;
+
+      let query = this.domainRepo.createQueryBuilder('d')
+        .where('d.domain = :domain', { domain: d })
+        .andWhere('d.listType IN (:...types)', { types: ['org_allow', 'global_allow', 'org_block', 'global_block'] });
+
+      if (isParent) {
+        query = query.andWhere('d.isWildcard = 1');
+      }
+
+      const result = await query.getOne();
+      if (result) return result;
+    }
+
+    return null;
+  }
+
   private async findInList(
     domains: string[], companyId: string | null, listTypes: string[]
   ): Promise<DomainDecision | null> {
@@ -84,12 +118,31 @@ export class AllowlistService {
     if (!input) return '';
     try {
       const str = String(input).trim();
-      const url = str.startsWith('http') ? str : `https://${str}`;
+      const url = /^https?:\/\//i.test(str) ? str : `https://${str}`;
       let hostname = new URL(url).hostname;
       if (hostname.startsWith('www.')) hostname = hostname.slice(4);
       return hostname.toLowerCase();
     } catch {
       return String(input).trim().toLowerCase();
+    }
+  }
+
+  // Проверить конфликт: домен не может быть одновременно в allow и block
+  async ensureNoConflict(domain: string, targetListType: 'allow' | 'block'): Promise<void> {
+    const normalized = this.normalizeDomain(domain);
+    const conflictTypes = targetListType === 'allow'
+      ? ['org_block', 'global_block']
+      : ['org_allow', 'global_allow'];
+
+    const conflict = await this.domainRepo
+      .createQueryBuilder('d')
+      .where('d.domain = :domain', { domain: normalized })
+      .andWhere('d.listType IN (:...types)', { types: conflictTypes })
+      .getOne();
+
+    if (conflict) {
+      const listName = targetListType === 'allow' ? 'blocklist' : 'allowlist';
+      throw new Error(`CONFLICT: Domain "${normalized}" is in ${listName} (${conflict.listType}). Remove it first.`);
     }
   }
 
@@ -103,15 +156,8 @@ export class AllowlistService {
     const normalized = this.normalizeDomain(domain);
     const listType = isGlobal ? 'global_allow' : 'org_allow';
 
-    // Проверяем конфликт с blocklist
-    const inBlocklist = await this.domainRepo
-      .createQueryBuilder('d')
-      .where('d.domain = :domain', { domain: normalized })
-      .andWhere('d.listType IN (:...types)', { types: ['org_block', 'global_block'] })
-      .getOne();
-    if (inBlocklist) {
-      throw new Error(`CONFLICT: Domain "${normalized}" is in blocklist (${inBlocklist.listType}). Remove it from blocklist first.`);
-    }
+    // Централизованная проверка конфликта с blocklist
+    await this.ensureNoConflict(normalized, 'allow');
     
     // Проверяем конфликт — если уже в allowlist другого типа
     const existingAllow = await this.domainRepo
@@ -167,23 +213,12 @@ export class AllowlistService {
     reason?: string;
     notes?: string;
     riskScore?: number;
-    forceOverride?: boolean;
   } = {}): Promise<DomainDecision> {
     const normalized = this.normalizeDomain(domain);
     const listType = isGlobal ? 'global_block' : 'org_block';
 
-    // Проверяем конфликт с allowlist (если не force override)
-    if (!options.forceOverride) {
-      const inAllowlist = await this.domainRepo.findOne({
-        where: [
-          { domain: normalized, companyId: companyId || '', listType: 'org_allow' },
-          { domain: normalized, listType: 'global_allow' },
-        ],
-      });
-      if (inAllowlist) {
-        throw new Error(`CONFLICT: Domain "${normalized}" is in allowlist (${inAllowlist.listType}). Remove it from allowlist first.`);
-      }
-    }
+    // Централизованная проверка конфликта с allowlist — всегда, без исключений
+    await this.ensureNoConflict(normalized, 'block');
 
     const existing = await this.domainRepo.findOne({
       where: { domain: normalized, companyId: companyId || undefined },
@@ -216,21 +251,30 @@ export class AllowlistService {
   }
 
   // Получить весь allowlist организации
-  async getAllowlist(companyId: string, isGlobal?: boolean) {
+  async getAllowlist(companyId: string, isGlobal?: boolean, isModerator = false) {
     let query = this.domainRepo.createQueryBuilder('d')
       .where('d.listType IN (:...types)', { types: ['global_allow', 'org_allow'] });
 
     if (isGlobal !== undefined) {
       query = query.andWhere('d.isGlobal = :isGlobal', { isGlobal });
-    } else {
+    } else if (!isModerator) {
       query = query.andWhere('(d.companyId = :companyId OR d.isGlobal = 1)', { companyId });
     }
 
     return query.orderBy('d.category', 'ASC').addOrderBy('d.domain', 'ASC').getMany();
   }
 
-  // Получить весь blocklist организации
-  async getBlocklist(companyId: string) {
+  // Получить весь blocklist (модератор видит все компании)
+  async getBlocklist(companyId: string, isModerator = false) {
+    if (isModerator) {
+      return this.domainRepo.find({
+        where: [
+          { listType: 'org_block' },
+          { listType: 'global_block' },
+        ],
+        order: { createdAt: 'DESC' },
+      });
+    }
     return this.domainRepo.find({
       where: [
         { companyId, listType: 'org_block' },
@@ -294,36 +338,101 @@ export class AllowlistService {
   }
 
   // Удалить домен из любого списка
-  async removeFromList(domain: string, companyId: string): Promise<{ success: boolean }> {
+  async removeFromList(domain: string, companyId: string, isModerator = false): Promise<{ success: boolean }> {
     const normalized = this.normalizeDomain(domain);
-    
-    // Удаляем org записи
-    await this.domainRepo.query(
-      `DELETE FROM domain_decisions WHERE domain = ? AND companyId = ? AND listType IN ('org_allow','org_block','pending_review','approved','blocked')`,
-      [normalized, companyId]
-    );
-    
+
+    // Удаляем org записи (модератор — все компании, иначе — только свою)
+    if (isModerator) {
+      await this.domainRepo.query(
+        `DELETE FROM domain_decisions WHERE domain = ? AND listType IN ('org_allow','org_block','pending_review','approved','blocked')`,
+        [normalized]
+      );
+    } else {
+      await this.domainRepo.query(
+        `DELETE FROM domain_decisions WHERE domain = ? AND companyId = ? AND listType IN ('org_allow','org_block','pending_review','approved','blocked')`,
+        [normalized, companyId]
+      );
+    }
+
     // Удаляем глобальные записи созданные модератором (не system seed)
     await this.domainRepo.query(
       `DELETE FROM domain_decisions WHERE domain = ? AND isGlobal = 1 AND decidedBy != 'system' AND listType IN ('global_allow','global_block')`,
       [normalized]
     );
-    
+
     this.logger.log(`Removed from lists: ${normalized}`);
     return { success: true };
   }
 
 
   // Редактировать запись в allowlist
-  async updateEntry(id: string, updates: { category?: string; notes?: string; isWildcard?: boolean }, moderatorId: string): Promise<DomainDecision> {
+  async updateEntry(id: string, updates: { category?: string; notes?: string; isWildcard?: boolean }, moderatorId: string): Promise<DomainDecision & { closedSubdomains?: number }> {
     const entry = await this.domainRepo.findOne({ where: { id } });
     if (!entry) throw new Error('Entry not found');
+
+    // Нормализуем домен перед любой операцией
+    const normalized = this.normalizeDomain(entry.domain);
+    if (normalized !== entry.domain) {
+      entry.domain = normalized;
+    }
+
+    // Детектим переключение wildcard false → true
+    const wildcardJustEnabled = updates.isWildcard === true && !entry.isWildcard;
+
     if (updates.category !== undefined) entry.category = updates.category;
     if (updates.notes !== undefined) entry.notes = updates.notes;
     if (updates.isWildcard !== undefined) entry.isWildcard = updates.isWildcard;
     entry.approvedBy = moderatorId;
-    this.logger.log(`Updated allowlist entry: ${entry.domain}`);
-    return this.domainRepo.save(entry);
+    const saved = await this.domainRepo.save(entry);
+    this.logger.log(`Updated allowlist entry: ${entry.domain}${wildcardJustEnabled ? ' (wildcard enabled)' : ''}`);
+
+    // Если wildcard только что включён — закрываем все pending поддомены
+    let closedSubdomains = 0;
+    if (wildcardJustEnabled) {
+      const pendingEvents = await this.domainRepo.find({ where: { decision: 'pending' } });
+      const subdomains = pendingEvents.filter(e => {
+        const nd = this.normalizeDomain(e.domain);
+        return nd !== normalized && nd.endsWith('.' + normalized);
+      });
+
+      for (const sub of subdomains) {
+        sub.decision = 'approved';
+        sub.decidedBy = moderatorId;
+        await this.domainRepo.save(sub);
+
+        // Audit log — как при обычном approve из Queue
+        await this.actionRepo.save(this.actionRepo.create({
+          eventId: sub.id,
+          domain: sub.domain,
+          companyId: sub.companyId || '',
+          action: 'approved',
+          reason: `Auto-approved: wildcard *.${normalized} enabled`,
+          moderatorId,
+          isGlobal: entry.isGlobal,
+          source: 'wildcard',
+          category: entry.category || 'other',
+        }));
+
+        // WebSocket push — чтобы extension узнал о решении
+        if (sub.companyId) {
+          this.eventsGateway.sendDecisionToDispatchers(sub.companyId, {
+            type: 'decision',
+            eventId: sub.id,
+            domain: sub.domain,
+            decision: 'approved',
+            message: `Auto-approved: wildcard *.${normalized}`,
+          });
+        }
+
+        closedSubdomains++;
+      }
+
+      if (closedSubdomains > 0) {
+        this.logger.log(`Wildcard edit ${normalized}: auto-approved ${closedSubdomains} pending subdomains`);
+      }
+    }
+
+    return { ...saved, closedSubdomains };
   }
 
 }
